@@ -1,0 +1,203 @@
+name: Reusable Release Workflow
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Release version (e.g., 1.0.0 - without v prefix)'
+        required: true
+        type: string
+      release_type:
+        description: 'Type of release'
+        required: false
+        default: 'release'
+        type: string
+      release_notes:
+        description: 'Custom release notes (optional - will auto-generate if empty)'
+        required: false
+        type: string
+      python_version:
+        description: 'Python version to use'
+        required: false
+        default: '3.14'
+        type: string
+      package_name:
+        description: 'Name of the Python package'
+        required: false
+        type: string
+      run_tests:
+        description: 'Whether to run tests before release'
+        required: false
+        default: true
+        type: boolean
+      test_command:
+        description: 'Command to run tests'
+        required: false
+        default: 'python -c "import sys; print(\"✓ Package imports successfully\")"'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Validate and prepare version
+      id: version
+      run: |
+        VERSION="${{ inputs.version }}"
+        VERSION=${VERSION#v}
+        
+        if [[ ! $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]; then
+          echo "Error: Version must follow semantic versioning format (e.g., 1.0.0, 1.0.0-beta)"
+          exit 1
+        fi
+        
+        TAG_NAME="v${VERSION}"
+        
+        if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+          echo "Error: Tag $TAG_NAME already exists"
+          exit 1
+        fi
+        
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+        echo "Version validated: $TAG_NAME"
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Install dependencies and build
+      run: |
+        python -m pip install --upgrade pip
+        pip install build
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        if [ -f pyproject.toml ] || [ -f setup.py ]; then pip install -e .; fi
+
+    - name: Detect package name
+      id: package
+      run: |
+        PACKAGE_NAME="${{ inputs.package_name }}"
+        if [ -z "$PACKAGE_NAME" ]; then
+          # Try to detect from pyproject.toml
+          if [ -f pyproject.toml ]; then
+            PACKAGE_NAME=$(grep '^name = ' pyproject.toml | sed 's/name = "\(.*\)"/\1/' || echo "")
+          fi
+          # Fallback to repository name
+          if [ -z "$PACKAGE_NAME" ]; then
+            PACKAGE_NAME="${{ github.event.repository.name }}"
+          fi
+        fi
+        echo "package_name=$PACKAGE_NAME" >> $GITHUB_OUTPUT
+        echo "Detected package name: $PACKAGE_NAME"
+
+    - name: Update version in pyproject.toml
+      run: |
+        if [ -f pyproject.toml ]; then
+          sed -i 's/version = ".*"/version = "${{ steps.version.outputs.version }}"/' pyproject.toml
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action Bot"
+        fi
+
+    - name: Run tests
+      if: inputs.run_tests
+      run: ${{ inputs.test_command }}
+
+    - name: Build Python package
+      run: |
+        python -m build
+        echo "✓ Python package built successfully"
+        ls -la dist/
+
+    - name: Generate release notes
+      id: release_notes
+      run: |
+        CUSTOM_NOTES="${{ inputs.release_notes }}"
+        
+        if [ -n "$CUSTOM_NOTES" ]; then
+          echo "Using custom release notes"
+          echo "release_body<<EOF" >> $GITHUB_OUTPUT
+          echo "$CUSTOM_NOTES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        else
+          echo "Auto-generating release notes from commits"
+          
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          
+          if [ -n "$PREVIOUS_TAG" ]; then
+            echo "Generating changelog from $PREVIOUS_TAG to HEAD"
+            COMMITS=$(git log --pretty=format:"- %s (%h)" $PREVIOUS_TAG..HEAD --no-merges)
+            COMPARE_URL="https://github.com/${{ github.repository }}/compare/$PREVIOUS_TAG...${{ steps.version.outputs.tag_name }}"
+          else
+            echo "No previous tag found, listing all commits"
+            COMMITS=$(git log --pretty=format:"- %s (%h)" HEAD --no-merges)
+            COMPARE_URL="https://github.com/${{ github.repository }}/commits/${{ steps.version.outputs.tag_name }}"
+          fi
+          
+          echo "release_body<<EOF" >> $GITHUB_OUTPUT
+          echo "## What's Changed" >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_OUTPUT
+          echo "$COMMITS" >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_OUTPUT
+          echo "## Installation" >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_OUTPUT
+          echo '```bash' >> $GITHUB_OUTPUT
+          echo "pip install git+https://github.com/${{ github.repository }}.git@${{ steps.version.outputs.tag_name }}" >> $GITHUB_OUTPUT
+          echo '```' >> $GITHUB_OUTPUT
+          echo "" >> $GITHUB_OUTPUT
+          echo "**Full Changelog**: $COMPARE_URL" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create Git tag
+      run: |
+        if [ -f pyproject.toml ]; then
+          git add pyproject.toml
+          git commit -m "chore: bump version to ${{ steps.version.outputs.version }}" || echo "No changes to commit"
+        fi
+        git tag -a "${{ steps.version.outputs.tag_name }}" -m "Release ${{ steps.version.outputs.tag_name }}"
+        echo "✓ Git tag created: ${{ steps.version.outputs.tag_name }}"
+
+    - name: Push changes and tag
+      run: |
+        git push origin main || echo "No changes to push to main"
+        git push origin "${{ steps.version.outputs.tag_name }}"
+        echo "✓ Tag pushed to repository"
+
+    - name: Create GitHub Release
+      id: create_release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.version.outputs.tag_name }}
+        name: "${{ steps.package.outputs.package_name }} ${{ steps.version.outputs.tag_name }}"
+        body: ${{ steps.release_notes.outputs.release_body }}
+        draft: ${{ inputs.release_type == 'draft' }}
+        prerelease: ${{ inputs.release_type == 'prerelease' }}
+        files: |
+          dist/*.whl
+          dist/*.tar.gz
+        generate_release_notes: false
+
+    - name: Success Summary
+      run: |
+        echo "## 🎉 Release Created Successfully!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Release Details" >> $GITHUB_STEP_SUMMARY
+        echo "- **Package**: ${{ steps.package.outputs.package_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Version**: ${{ steps.version.outputs.tag_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Type**: ${{ inputs.release_type }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Release URL**: ${{ steps.create_release.outputs.url }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Quick Install" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+        echo "pip install git+https://github.com/${{ github.repository }}.git@${{ steps.version.outputs.tag_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

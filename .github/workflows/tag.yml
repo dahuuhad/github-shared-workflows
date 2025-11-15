@@ -1,0 +1,70 @@
+name: Reusable Tag Creation
+
+on:
+  workflow_call:
+    inputs:
+      tag_name:
+        description: 'Tag name (e.g., v1.0.0)'
+        required: true
+        type: string
+      message:
+        description: 'Tag message'
+        required: false
+        default: 'Tag created via GitHub Actions'
+        type: string
+      push_to_remote:
+        description: 'Whether to push tag to remote'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  create-tag:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Validate tag name
+      run: |
+        TAG_NAME="${{ inputs.tag_name }}"
+        
+        if [[ ! $TAG_NAME =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]; then
+          echo "Warning: Tag name doesn't follow semantic versioning format"
+        fi
+        
+        if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+          echo "Error: Tag $TAG_NAME already exists"
+          exit 1
+        fi
+        
+        echo "Tag name validated: $TAG_NAME"
+
+    - name: Create and push tag
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action Bot"
+        
+        git tag -a "${{ inputs.tag_name }}" -m "${{ inputs.message }}"
+        echo "✓ Tag created locally: ${{ inputs.tag_name }}"
+        
+        if [ "${{ inputs.push_to_remote }}" == "true" ]; then
+          git push origin "${{ inputs.tag_name }}"
+          echo "✓ Tag pushed to remote: ${{ inputs.tag_name }}"
+        else
+          echo "Tag created locally but not pushed (push_to_remote=false)"
+        fi
+
+    - name: Success Summary
+      run: |
+        echo "## ✅ Tag Created Successfully!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Tag**: ${{ inputs.tag_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Message**: ${{ inputs.message }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Pushed to remote**: ${{ inputs.push_to_remote }}" >> $GITHUB_STEP_SUMMARY
